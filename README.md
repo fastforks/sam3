@@ -1,3 +1,42 @@
+# SAM 3: faster inference fork
+
+> **You are on `cuda-kernels`.** Research fork of [facebookresearch/sam3](https://github.com/facebookresearch/sam3) (base `0570b3a`; `main` mirrors upstream). Two branches:
+> - [`portable`](https://github.com/fastforks/sam3/tree/portable): plain PyTorch, no build step; the included ONNX exporter covers the fixed-resolution ViT trunk + neck (for a TensorRT engine), the rest stays eager.
+> - [`cuda-kernels`](https://github.com/fastforks/sam3/tree/cuda-kernels): `portable` plus custom kernels (flash attention for the ViT and the tracker memory attention, prebuilt for sm_80 to sm_120; Triton RoPE / GroupNorm; fp16-accumulate GEMMs and convolutions, which need `pip install nvidia-cudnn-frontend`; optional fp8 trunk).
+> Licence, as upstream: [SAM License](LICENSE) (code and weights). Weights are gated on Hugging Face and not included here.
+
+```python
+from sam3.fast import FastSam3
+m = FastSam3.load("sam3.pt")               # custom kernels on by default (kernels=False: the portable path)
+m.calibrate(images)                         # optional: fp8 ViT trunk (sm_89 and newer)
+out = m(image, "wheel")                     # dict: masks (n, H, W) bool, boxes (n, 4) xyxy px, scores (n,)
+```
+Video: `FastSam3Video(predictor.model)` (SAM 3) / `FastSam3Video31(predictor.model)` (SAM 3.1) patch the upstream video predictor in place. Tests: `SAM3_CHECKPOINT=/path/to/sam3.pt pytest test/test_fast.py`.
+
+**Image** (text prompt, masks to the host). RTX 5060 Ti 16 GB, torch 2.14.1+cu130, 2026-10-12; cold process, median of 10 runs after one first call. A = 1297x840 image at model resolution 1008, B = 5 MP image at 1008, C = image A at resolution 1344. Memory = torch peak allocated / reserved; model weights 3410 MB upstream (fp32) vs 1864 MB here (fp16). Agreement: symmetric mask IoU vs upstream on 40 COCO val images x text prompts / 16 box prompts, and mask IoU vs the COCO ground truth (upstream: 0.7945).
+
+| version | A ms | B ms | C ms | speed-up at A | peak MB at A | peak MB at C | startup / first-call overhead / new-size overhead | IoU vs upstream (text / box) | IoU vs GT |
+|---|---|---|---|---|---|---|---|---|---|
+| upstream (bf16 autocast, as its README) | 218 | 228 | 392 | 1.00x | 3902 / 4278 | 4450 / 5092 | 10.9 s / +810 ms / rebuild 8.3 s* | 1 / 1 | 0.7945 |
+| **portable** | 179 | 183 | 335 | 1.22x | 2369 / 2768 | 2985 / 3530 | 5.0 s / +500 ms / +8 ms | 0.9956 / 0.9901 | 0.7947 |
+| TensorRT fp16 trunk + neck (from `portable`), rest eager | 111 | - | - | 1.97x | - | - | engine load 0.56 s / fixed 1008 engine | union IoU vs eager 0.9997 (3 images) | - |
+| **cuda-kernels** | 115 | 120 | 215 | 1.89x | 2258 / 2582 | 2792 / 3186 | 4.9 s / +1447 ms / +27 ms (Triton JIT) | 0.9957 / 0.9900 | 0.7947 |
+| cuda-kernels + fp8 trunk (`calibrate`, sm_89+) | 88 | 92 | 167 | 2.49x | 1848 / 2486 | 2381 / 3120 | 6.5 s / +896 ms / +33 ms (startup incl. calibration) | 0.9924 / 0.9717 | 0.7942 |
+
+\* Upstream builds the model for one resolution; a new resolution means rebuilding it. Here the resolution is an argument (no per-size compile). The TensorRT row is from the earlier study (same GPU, 2026-10-10).
+
+**Video** (`assets/videos/0001`, text prompt "person", 4 tracked objects, 41 output frames incl. the prompt frame; ms/frame = summed model-call time / output frames, without session and prompt setup; peak MB = allocated / reserved; SAM 3.1: detector fast path only, tracker as upstream, FA3 / real RoPE / compile off, `batched_grounding_batch_size=4` and `postprocess_batch_size=4` since the default 16 / 16 runs out of memory on 16 GB).
+
+| version | SAM 3 ms/frame | speed-up | peak MB | SAM 3.1 ms/frame | speed-up | peak MB |
+|---|---|---|---|---|---|---|
+| upstream | 402 | 1.00x | 6770 / 7122 | 388 | 1.00x | 10668 / 11550 |
+| **portable** | 353 | 1.14x | 5007 / 5498 | 354 | 1.10x | 9792 / 10558 |
+| **cuda-kernels** | 220 | 1.83x | 4709 / 4998 | 258 | 1.50x | 9345 / 9618 |
+
+Upstream runs under bf16 autocast, the fork in fp16 (same tensor-core rate).
+
+---
+
 # SAM 3: Segment Anything with Concepts
 
 Meta Superintelligence Labs
