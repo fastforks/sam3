@@ -16,6 +16,8 @@ from typing import List, Optional
 
 import psutil
 import torch
+from sam3.fast import uses_compile_or_fa3
+from sam3.fast_video import FastSam3Video
 from sam3.logger import get_logger
 from sam3.model.sam3_base_predictor import Sam3BasePredictor
 
@@ -53,6 +55,9 @@ class Sam3VideoPredictor(Sam3BasePredictor):
             .cuda()
             .eval()
         )
+        if not uses_compile_or_fa3(self.model):
+            # inference only: fp16 weights, fast detector and tracker
+            FastSam3Video(self.model)
 
     def remove_object(
         self,

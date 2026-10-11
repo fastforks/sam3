@@ -13,6 +13,8 @@ via the shared Sam3BasePredictor handle_request/handle_stream_request API.
 from typing import Dict, Optional
 
 import torch
+from sam3.fast import uses_compile_or_fa3
+from sam3.fast_video31 import FastSam3Video31
 from sam3.logger import get_logger
 from sam3.model.sam3_base_predictor import Sam3BasePredictor
 
@@ -39,6 +41,9 @@ class Sam3MultiplexVideoPredictor(Sam3BasePredictor):
         warm_up=False,
     ):
         super().__init__()
+        if not uses_compile_or_fa3(model):
+            # inference only: fp16 detector weights, fast detector
+            FastSam3Video31(model)
         self.model = model
         self.session_expiration_sec = session_expiration_sec
         self.default_output_prob_thresh = default_output_prob_thresh

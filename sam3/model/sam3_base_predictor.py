@@ -148,8 +148,10 @@ class Sam3BasePredictor:
         init_kwargs = dict(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
-            offload_state_to_cpu=offload_state_to_cpu,
         )
+        # SAM 3.1's init_state has no offload_state_to_cpu argument
+        if offload_state_to_cpu:
+            init_kwargs["offload_state_to_cpu"] = True
         if hasattr(self, "async_loading_frames"):
             init_kwargs["async_loading_frames"] = self.async_loading_frames
         if hasattr(self, "video_loader_type"):
