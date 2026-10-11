@@ -9,7 +9,13 @@
 Any model resolution (multiple of 14; 1008 = training size), any input image size, nothing compiled per size.
 Plain PyTorch ops only (exports to ONNX / TensorRT): fp16 weights, ViT residual stream in window order, SDPA, lean text
 encoder, GPU preprocessing, no GPU -> host syncs before the outputs.
+
+kernels=True (cuda-kernels branch default) adds, not exportable: vendored fastbb flash attention and fp16-accumulate
+GEMMs / neck convolutions, Triton RoPE and GroupNorm, a fused bias + GELU epilogue; calibrate(images) optionally runs the
+ViT GEMMs in fp8. kernels=False is the portable path.
 """
+
+import contextlib
 
 import numpy as np
 import torch
@@ -20,9 +26,21 @@ from .fast_vit import FastViT
 from .model import box_ops
 
 
+@contextlib.contextmanager
+def fp16_accumulate(enabled=True):
+    old = torch.backends.cuda.matmul.allow_fp16_accumulation
+    torch.backends.cuda.matmul.allow_fp16_accumulation = bool(enabled)
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation = old
+
+
 class FastSam3:
-    def __init__(self, model, resolution=1008, conf=0.5, text_trim=True, text_cache=False, channels_last=True):
+    def __init__(self, model, resolution=1008, conf=0.5, text_trim=True, text_cache=False, channels_last=True,
+                 kernels=True, hacc_convs=None):
         self.m = model.eval()
+        self.kernels = kernels
         self.res = resolution
         self.conf = conf
         self.text_trim = text_trim
@@ -31,7 +49,7 @@ class FastSam3:
         neck = bb.vision_backbone
         for mod in (neck, bb.language_backbone, model.transformer.encoder, model.segmentation_head):
             mod.half()  # the decoder (200 queries) stays fp32 as upstream (its FFN runs outside autocast, residuals fp32)
-        self.vit = FastViT(neck.trunk)
+        self.vit = FastViT(neck.trunk, attn="hh" if kernels else "sdpa", kernels=kernels)
         self.neck = neck
         self.pe_cache = {}
         self.ftext = FastText(bb.language_backbone, cache=text_cache) if text_trim else None
@@ -40,6 +58,25 @@ class FastSam3:
             if neck.sam2_convs is not None:
                 neck.sam2_convs.to(memory_format=torch.channels_last)
             model.segmentation_head.to(memory_format=torch.channels_last)
+        if kernels:
+            self._fast_pixel_decoder()
+        # hacc_convs: fp16-accumulating cuDNN convolutions (precompiled plans, no per-size tuning). "neck" (default with
+        # kernels) = the FPN neck; "neck+seg2" also patches the segmentation-head convs that keep their masks under fp16
+        # accumulation (pixel_decoder.conv_layers 0 / 1 do not: their masks break, so the full head is never patched).
+        if hacc_convs is None:
+            hacc_convs = "neck" if kernels else False
+        if hacc_convs:
+            from .fastbb_vendored.cudnn_conv import patch_convs
+            patch_convs(neck.convs)
+            if neck.sam2_convs is not None:
+                patch_convs(neck.sam2_convs)
+            if hacc_convs == "neck+seg2":
+                sh = model.segmentation_head
+                patch_convs(sh.pixel_decoder.conv_layers[2])
+                patch_convs(sh.instance_seg_head)
+                patch_convs(sh.semantic_seg_head)
+            elif hacc_convs != "neck":
+                raise ValueError(f"hacc_convs: None, False, 'neck' or 'neck+seg2', not {hacc_convs!r}")
         self.m.backbone.forward_image = self._forward_image
         self.pin = {}
         torch.cuda.empty_cache()  # drop the freed fp32 blocks of the original weights (peak reserved = what the model needs)
@@ -62,7 +99,7 @@ class FastSam3:
         return self.pe_cache[k]
 
     def _forward_image(self, samples):
-        with torch.autocast("cuda", enabled=False):
+        with torch.autocast("cuda", enabled=False), fp16_accumulate(self.kernels):
             f = self.vit(samples.half())
             outs, pos = [], []
             for conv in self.neck.convs[:-1]:  # scalp=1: the lowest-resolution level is computed and dropped upstream
@@ -71,12 +108,37 @@ class FastSam3:
                 pos.append(self._pos(o).expand(o.shape[0], -1, -1, -1))
         sam2 = None
         if self.neck.sam2_convs is not None:  # video detector: second (tracker) neck on the same trunk output
-            with torch.autocast("cuda", enabled=False):
+            with torch.autocast("cuda", enabled=False), fp16_accumulate(self.kernels):
                 o2 = [conv(f) for conv in self.neck.sam2_convs[:-1]]
             sam2 = {"vision_features": o2[-1], "vision_pos_enc": pos, "backbone_fpn": o2}
         return {"vision_features": outs[-1], "vision_pos_enc": pos, "backbone_fpn": outs, "sam2_backbone_out": sam2}
 
     # ---------------- pre / post ----------------
+    def _fast_pixel_decoder(self):
+        """Triton GroupNorm+ReLU for the channels_last pixel decoder (torch's NHWC group_norm runs at ~1/8 of bandwidth)"""
+        from .fast_kernels import group_norm_nhwc
+        pd = self.m.segmentation_head.pixel_decoder
+
+        def forward(backbone_feats):
+            prev = backbone_feats[-1]
+            for i, bb in enumerate(backbone_feats[:-1][::-1]):
+                prev = bb + F.interpolate(prev, size=bb.shape[-2:], mode=pd.interpolation_mode)
+                prev = pd.conv_layers[i](prev)
+                prev = group_norm_nhwc(prev, pd.norms[i].weight, pd.norms[i].bias, pd.norms[i].num_groups, pd.norms[i].eps, relu=True)
+            return prev
+        pd.forward = forward
+
+    def calibrate(self, images):
+        """fp8 option (kernels=True): static per-tensor activation scales for the ViT GEMMs from a few images (uint8 HxWx3),
+        then the trunk runs its GEMMs in e4m3 (torch._scaled_mm, ~2x the fp16-accumulate rate) with Triton LayerNorm / GELU /
+        residual / quantisation kernels."""
+        if not self.kernels:
+            raise ValueError("calibrate() needs kernels=True")
+        xs = [self._pre(im)[0] for im in images]
+        with torch.inference_mode(), torch.autocast("cuda", enabled=False), fp16_accumulate(self.kernels):
+            self.vit.calibrate(xs)
+        torch.cuda.empty_cache()
+
     def _pre(self, im):
         """im: uint8 HxWx3 numpy (or torch [3,H,W] uint8 on the GPU) -> normalised fp16 [1,3,R,R]"""
         if isinstance(im, np.ndarray):
@@ -101,7 +163,7 @@ class FastSam3:
     def set_image(self, im):
         """image (uint8 HxWx3 numpy, or [3,H,W] uint8 GPU tensor) -> state (vision features); reuse it for several prompts"""
         x, H, W = self._pre(im)
-        with torch.autocast("cuda", dtype=torch.float16):
+        with torch.autocast("cuda", dtype=torch.float16), fp16_accumulate(self.kernels):
             bo = self.m.backbone.forward_image(x)
         return dict(bo=bo, H=H, W=W)
 
@@ -114,7 +176,7 @@ class FastSam3:
         all positive; prompt "visual" for boxes only)"""
         m, H, W = self.m, state["H"], state["W"]
         bo = dict(state["bo"])
-        with torch.autocast("cuda", dtype=torch.float16):
+        with torch.autocast("cuda", dtype=torch.float16), fp16_accumulate(self.kernels):
             txt = self.ftext(prompt, self.dev) if self.ftext else m.backbone.forward_text([prompt], device=self.dev)
             bo.update(txt)
             gp = m._get_dummy_prompt()
