@@ -353,9 +353,9 @@ class TransformerEncoder(nn.Module):
         src_flatten = torch.cat(src_flatten, 1)  # bs, \sum{hxw}, c
         mask_flatten = torch.cat(mask_flatten, 1) if has_mask else None  # bs, \sum{hxw}
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)  # bs, \sum{hxw}, c
-        spatial_shapes = torch.tensor(
-            spatial_shapes, dtype=torch.long, device=src_flatten.device
-        )
+        # Keep the small, static shape table on the host. A device tensor here makes every later
+        # read of H, W (asserts, reshapes, level splits) an implicit GPU -> host sync.
+        spatial_shapes = torch.tensor(spatial_shapes, dtype=torch.long, device="cpu")
         level_start_index = torch.cat(
             (
                 spatial_shapes.new_zeros((1,)),
