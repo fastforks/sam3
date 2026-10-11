@@ -600,50 +600,54 @@ def build_sam3_image_model(
             "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
         )
 
-    # Create visual components
-    compile_mode = "default" if compile else None
-    vision_encoder = _create_vision_backbone(
-        compile_mode=compile_mode, enable_inst_interactivity=enable_inst_interactivity
-    )
-
-    # Create text components
-    text_encoder = _create_text_encoder(bpe_path)
-
-    # Create visual-language backbone
-    backbone = _create_vl_backbone(vision_encoder, text_encoder)
-
-    # Create transformer components
-    transformer = _create_sam3_transformer()
-
-    # Create dot product scoring
-    dot_prod_scoring = _create_dot_product_scoring()
-
-    # Create segmentation head if enabled
-    segmentation_head = (
-        _create_segmentation_head(compile_mode=compile_mode)
-        if enable_segmentation
-        else None
-    )
-
-    # Create geometry encoder
-    input_geometry_encoder = _create_geometry_encoder()
-    if enable_inst_interactivity:
-        sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False)
-        inst_predictor = SAM3InteractiveImagePredictor(sam3_pvs_base)
-    else:
-        inst_predictor = None
-    # Create the SAM3 model
-    model = _create_sam3_model(
-        backbone,
-        transformer,
-        input_geometry_encoder,
-        segmentation_head,
-        dot_prod_scoring,
-        inst_predictor,
-        eval_mode,
-    )
     if load_from_HF and checkpoint_path is None:
         checkpoint_path = download_ckpt_from_hf(version="sam3")
+    # with a checkpoint, create the parameters directly on the target device
+    # (no CPU init + copy; the checkpoint overwrites them)
+    with torch.device(device if checkpoint_path is not None else "cpu"):
+        # Create visual components
+        compile_mode = "default" if compile else None
+        vision_encoder = _create_vision_backbone(
+            compile_mode=compile_mode,
+            enable_inst_interactivity=enable_inst_interactivity,
+        )
+
+        # Create text components
+        text_encoder = _create_text_encoder(bpe_path)
+
+        # Create visual-language backbone
+        backbone = _create_vl_backbone(vision_encoder, text_encoder)
+
+        # Create transformer components
+        transformer = _create_sam3_transformer()
+
+        # Create dot product scoring
+        dot_prod_scoring = _create_dot_product_scoring()
+
+        # Create segmentation head if enabled
+        segmentation_head = (
+            _create_segmentation_head(compile_mode=compile_mode)
+            if enable_segmentation
+            else None
+        )
+
+        # Create geometry encoder
+        input_geometry_encoder = _create_geometry_encoder()
+        if enable_inst_interactivity:
+            sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False)
+            inst_predictor = SAM3InteractiveImagePredictor(sam3_pvs_base)
+        else:
+            inst_predictor = None
+        # Create the SAM3 model
+        model = _create_sam3_model(
+            backbone,
+            transformer,
+            input_geometry_encoder,
+            segmentation_head,
+            dot_prod_scoring,
+            inst_predictor,
+            eval_mode,
+        )
     # Load checkpoint if provided
     if checkpoint_path is not None:
         _load_checkpoint(model, checkpoint_path)
