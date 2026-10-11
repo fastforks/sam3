@@ -1,6 +1,10 @@
 """Fast SAM 3 ViT-L trunk for inference: fp16 weights, the residual stream kept in window order between the global
 blocks, real-arithmetic 2D RoPE from cached tables, any token grid (padding windows handled as upstream), nothing
-compiled per size. Plain PyTorch ops only (exports to ONNX / TensorRT)."""
+compiled per size. Plain PyTorch ops only (exports to ONNX / TensorRT).
+
+attn="sdpa" (default) or "explicit": MatMul - Softmax - MatMul in fp16 with the softmax scale folded into the q rows of
+the qkv weights (call fold_q_scale() first), the pattern TensorRT fuses into one attention kernel. An SDPA export is
+decomposed with fp32 casts and runs slower than eager under TensorRT."""
 import torch
 import torch.nn.functional as F
 
@@ -17,8 +21,8 @@ def rope_tables(h, w, head_dim, theta, scale_pos, device):
 
 
 class FastViT:
-    def __init__(self, vit, ws=24):
-        self.vit = vit
+    def __init__(self, vit, ws=24, attn="sdpa"):
+        self.vit, self.attn = vit, attn
         vit.half()
         self.blocks = list(vit.blocks)
         self.C = vit.blocks[0].norm1.weight.shape[0]
@@ -30,6 +34,14 @@ class FastViT:
         self.eps = vit.blocks[0].norm1.eps
         self._cache = {}
         self.pt = a0.rope_pt_size[0] if a0.rope_pt_size else ws  # RoPE pretraining (window) size = 24
+
+    def fold_q_scale(self):
+        """explicit-attention mode (TensorRT export): fold the 1/sqrt(64) = 1/8 softmax scale (exact in fp16) into the q rows of
+        every qkv projection; RoPE is a rotation, so scaling q before it is equivalent"""
+        for blk in self.blocks:
+            a = blk.attn.qkv
+            a.weight.data[: self.C] *= self.hd ** -0.5
+            a.bias.data[: self.C] *= self.hd ** -0.5
 
     # ---- per-size cached tensors ----
     def _tabs(self, h, w, device):
@@ -72,12 +84,19 @@ class FastViT:
         qk = qkv[:, :, :2].view(B, N, 2, self.nh, self.hd // 2, 2)
         c = cd.view(1, N, 1, 1, self.hd // 2, 2)
         s = sd.view(1, N, 1, 1, self.hd // 2, 2)
-        out = torch.addcmul(qk * c, qk.flip(-1), s)
+        if self.attn == "explicit":  # export mode: the ONNX addcmul multiplies by an fp32 constant (promotes to fp32)
+            out = qk * c + qk.flip(-1) * s
+        else:
+            out = torch.addcmul(qk * c, qk.flip(-1), s)
         return out.view(B, N, 2, self.nh, self.hd)
 
     def _attention(self, q, k, v):
         """q, k, v [B, N, H, 64] -> [B, N, H*64]"""
         B, N = q.shape[:2]
+        if self.attn == "explicit":  # q scale folded into the qkv weights (fold_q_scale)
+            qt, kt, vt = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            o = torch.matmul(torch.softmax(torch.matmul(qt, kt.transpose(-1, -2)), dim=-1), vt)
+            return o.transpose(1, 2).reshape(B, N, -1)
         # (cast: the ONNX exporter types SDPA as fp32)
         o = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).to(q.dtype)
         return o.transpose(1, 2).reshape(B, N, -1)
