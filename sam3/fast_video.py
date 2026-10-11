@@ -3,32 +3,33 @@
     vm = build_sam3_video_model(...)            # Sam3VideoInferenceWithInstanceInteractivity
     FastSam3Video(vm)                           # patches the model in place; use it via Sam3VideoPredictor as upstream
 Detector: the FastSam3 image path (trunk, both necks, encoder, heads); tracker: FastMemAttn memory attention and an fp16
-memory encoder. Plain PyTorch ops only.
+memory encoder. kernels=True (default here): the custom kernels of FastSam3 and FastMemAttn; kernels=False: plain PyTorch
+ops only.
 """
 import torch
 import torch.nn.functional as F
 
-from .fast import FastSam3
+from .fast import FastSam3, fp16_accumulate
 from .fast_memattn import FastMemAttn
 from .fast_text import FastText
 
 
 class FastSam3Video:
-    def __init__(self, vm):
-        self.vm = vm
+    def __init__(self, vm, kernels=True):
+        self.vm, self.kernels = vm, kernels
         det = vm.detector
-        self.fd = FastSam3(det, text_trim=False)   # trunk / neck / sam2 neck / encoder / heads
+        self.fd = FastSam3(det, text_trim=False, kernels=kernels)   # trunk / neck / sam2 neck / encoder / heads
         self._patch_detector(det)
         self._patch_tracker(vm.tracker)
 
     def _patch_tracker(self, trk):
         enc = trk.transformer.encoder
-        fma = FastMemAttn(enc)
+        fma = FastMemAttn(enc, kernels=self.kernels)
         self.fma = fma
 
         def forward(src, prompt, src_mask=None, prompt_mask=None, src_key_padding_mask=None, prompt_key_padding_mask=None, src_pos=None,
                     prompt_pos=None, feat_sizes=None, num_obj_ptr_tokens=0):
-            with torch.autocast("cuda", enabled=False):
+            with torch.autocast("cuda", enabled=False), fp16_accumulate(self.kernels):
                 mem = fma(src[0] if isinstance(src, list) else src, prompt, prompt_pos, num_obj_ptr_tokens,
                           src_pos[0] if isinstance(src_pos, list) else src_pos)
             return {"memory": mem, "pos_embed": src_pos[0] if isinstance(src_pos, list) else src_pos, "padding_mask": None}
@@ -46,7 +47,7 @@ class FastSam3Video:
         mb_forward = mb.forward
 
         def mb_fwd(pix_feat, masks, skip_mask_sigmoid=False):
-            with torch.autocast("cuda", enabled=False):
+            with torch.autocast("cuda", enabled=False), fp16_accumulate(self.kernels):
                 return mb_forward(pix_feat.half(), masks.half(), skip_mask_sigmoid=skip_mask_sigmoid)
         mb.forward = mb_fwd
 
@@ -71,6 +72,6 @@ class FastSam3Video:
         fg = det.forward_grounding
 
         def forward_grounding(*a, **k):
-            with torch.autocast("cuda", dtype=torch.float16):
+            with torch.autocast("cuda", dtype=torch.float16), fp16_accumulate(self.kernels):
                 return fg(*a, **k)
         det.forward_grounding = forward_grounding
