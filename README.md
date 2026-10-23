@@ -23,6 +23,8 @@ Video: `FastSam3Video(predictor.model)` (SAM 3) / `FastSam3Video31(predictor.mod
 | **cuda-kernels** | 115 | 120 | 215 | 1.89x | 2258 / 2582 | 2792 / 3186 | 4.9 s / +1447 ms / +27 ms (Triton JIT) | 0.9957 / 0.9900 | 0.7947 |
 | cuda-kernels + fp8 trunk (`calibrate`, sm_89+) | 88 | 92 | 167 | 2.49x | 1848 / 2486 | 2381 / 3120 | 6.5 s / +896 ms / +33 ms (startup incl. calibration) | 0.9924 / 0.9717 | 0.7942 |
 
+Flags: upstream already runs bf16 autocast. `cudnn.benchmark` + TF32 on top gave no gain (image A 222.0 -> 219.5 ms, within noise), so there is no separate flags row and speed-ups against "upstream + flags" equal those against upstream. Raw: `results/2026-10-23_flags_older_forks/` of the publishing workspace.
+
 \* Upstream builds the model for one resolution; a new resolution means rebuilding it. Here the resolution is an argument (no per-size compile). The TensorRT row is from the earlier study (same GPU, 2026-10-10).
 
 **Video** (`assets/videos/0001`, text prompt "person", 4 tracked objects, 41 output frames incl. the prompt frame; ms/frame = summed model-call time / output frames, without session and prompt setup; peak MB = allocated / reserved; SAM 3.1: detector fast path only, tracker as upstream, FA3 / real RoPE / compile off, `batched_grounding_batch_size=4` and `postprocess_batch_size=4` since the default 16 / 16 runs out of memory on 16 GB).
